@@ -1,1 +1,235 @@
+import warnings
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches mpatches
 
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.tree import DecisionTreeClassifier
+
+warnings.filterwarnings("ignore")
+
+# Tree assignment
+
+def left(n):  return 2 * n
+def right(n): return 2 * n + 1
+
+def _find_branch(b, node):
+    for (n, f, th), v in b.items():
+        if n == node and v: return f, th
+    return None
+
+def _predict_one(b, w, xi):
+    n = 1
+    for _ in range(30):
+        br = _find_branch(b, n)
+        if br is None: break
+        f, th = br
+        n = left(n) if xi[f] <= th else right(n)
+    for (nd, k), v in w.items():
+        if nd == n and v: return k
+    return 0
+
+def predict_tree(b, w, X):
+    return np.array([_predict_one(b, w, xi) for xi in X])
+
+def _misclassify_cost(b, w, xi, yi, gamma):
+    best = np.inf
+    def dfs(node, xi_cur, cost):
+        nonlocal best
+        if cost >= best: return
+        br = _find_branch(b, node)
+        if br is None:
+            for (nd, k), v in w.items():
+                if nd == node and v and k != yi:
+                    best = min(best, cost)
+            return
+        f, th = br
+        if xi_cur[f] <= th:
+            dfs(left(node), xi_cur, cost)
+            xi2 = xi_cur.copy()
+            delta = th + 1 - xi_cur[f]
+            xi2[f] = th + 1
+            dfs(right(node), xi2, cost + gamma[f] * delta)
+        else:
+            dfs(right(node), xi_cur, cost)
+            xi2 = xi_cur.copy()
+            delta = xi_cur[f] - th
+            xi2[f] = th
+            dfs(left(node), xi2, cost + gamma[f] * delta)
+
+    dfs(1, xi.astype(float).copy(), 0.0)
+    return best
+
+def _build_cart(X, y, depth):
+    clf = DecisionTreeClassifier(max_depth=depth, random_state=0)
+    clf.fit(X, y)
+    b, w, t = {}, {}, clf.tree_
+
+    def recurse(node, tree_node):
+        if t.feature[node] < 0:
+            w[(tree_node, int(np.argmax(t.value[node])))] = 1
+        else:
+            f, th = t.feature[node], int(t.threshold[node])
+            b[(tree_node, f, th)] = 1
+            recurse(t.children_left[node], left(tree_node))
+            recurse(t.children_right[node], right(tree_node))
+
+    recurse(0, 1)
+    return b, w
+
+# Tree Core algorithm 
+
+def robust_tree(X_tr, y_tr, depth, gamma, budget, max_iter=10):
+    X_cur = X_tr.copy().astype(float)
+
+    for _ in range(max_iter):
+        b, w = _build_cart(X_cur, y_tr, depth)
+        costs = []
+        for i in range(len(y_tr)):
+            if _predict_one(b, w, X_cur[i]) == y_tr[i]:
+                c = _misclassify_cost(b, w, X_tr[i].astype(float), y_tr[i], gamma)
+                costs.append((c, i))
+        costs.sort(key=lambda t: t[0])
+
+        used, changed = 0.0, False
+        X_new = X_tr.copy().astype(float)
+        for c, i in costs:
+            if used + c <= budget:
+                br = _find_branch(b, 1)
+                if br:
+                    f, th = br
+                    X_new[i, f] = th + 1 if X_new[i, f] <= th else th
+                used += c
+                changed = True
+
+        if not changed: break
+        X_cur = X_new
+
+    return b, w
+
+# Evaluation Mechanics
+
+def perturb_X(X, gamma, budget, n=300):
+    rng = np.random.default_rng(0)
+    out = []
+    for _ in range(n):
+        Xp = X.copy().astype(float)
+        rem = budget
+        for f in range(X.shape[1]):
+            if rem <= 0 or gamma[f] == 0: continue
+            max_d = int(rem / gamma[f])
+            if max_d < 1: continue
+            d = rng.integers(-max_d, max_d + 1)
+            Xp[:, f] += d
+            rem -= gamma[f] * abs(d)
+        out.append(Xp)
+    return out
+
+def evaluate(predict_fn, X_te, y_te, gamma, budget):
+    perturbed = perturb_X(X_te, gamma, budget)
+    accs = [np.mean(predict_fn(Xp) == y_te) for Xp in perturbed]
+    nom = predict_fn(X_te)
+    return {
+        "worst_case_acc": float(np.min(accs)),
+        "avg_acc": float(np.mean(accs)),
+        "f1": float(f1_score(y_te, nom, average="weighted", zero_division=0)),
+    }
+
+# Hyperparameter Configuration
+SEED = 42                # Controls data splitting and randomisation reproducibility
+DEPTH = 3                # Maximum depth of the robust classification tree
+LAMBDA_BUDGET = 0.85     # Uncertainty budget parameter (lower = more robust/conservative)
+Q_MEAN = 0.8             # Average feature reliability score for perturbations
+N_PERTURBATIONS = 300    # Number of evaluation attack scenarios to simulate
+
+# Main code
+
+# Specify your custom CSV filename or path here
+CSV_FILE_PATH = "heart_disease_uci.csv" 
+
+# Read raw dataset
+df = pd.read_csv(CSV_FILE_PATH)
+
+# Slice features and target (assumes target class is the final right-side column)
+X_raw = df.iloc[:, :-1].values
+y_raw = df.iloc[:, -1].values
+
+# Apply median binarisation
+X = (X_raw > np.median(X_raw, axis=0)).astype(int)
+y = y_raw
+
+# Hook up the SEED parameter here
+X_tr, X_te, y_tr, y_te = train_test_split(
+    X, y, test_size=0.2, random_state=SEED, stratify=y
+)
+
+# Hook up SEED, Q_MEAN, and LAMBDA_BUDGET here
+rng = np.random.default_rng(SEED)
+gamma = np.log(1 / (1 - np.clip(rng.normal(Q_MEAN, 0.15, X.shape[1]), 0.05, 0.95)))
+budget = -len(y_tr) * np.log(LAMBDA_BUDGET)
+
+results = {}
+
+# Hook up DEPTH here
+b, w = robust_tree(X_tr, y_tr, depth=DEPTH, gamma=gamma, budget=budget)
+results["Robust Tree"] = evaluate(lambda Xp: predict_tree(b, w, Xp), X_te, y_te, gamma, budget)
+
+# Hook up SEED for the Random Forest baseline
+baselines = {
+    "SVM": SVC(kernel="rbf"),
+    "Logistic Regression": LogisticRegression(max_iter=500),
+    "Random Forest": RandomForestClassifier(n_estimators=100, random_state=SEED),
+}
+for name, clf in baselines.items():
+    clf.fit(X_tr, y_tr)
+    results[name] = evaluate(clf.predict, X_te, y_te, gamma, budget)
+
+# output and display
+
+# Print summary matrix text format
+print(f"\n{'Model':<22} | {'Worst-Case Acc':<15} | {'Avg Acc':<10} | {'F1 Score':<10}")
+print("-" * 68)
+for model, metrics in results.items():
+    print(f"{model:<22} | {metrics['worst_case_acc']:<15.4f} | {metrics['avg_acc']:<10.4f} | {metrics['f1']:<10.4f}")
+
+# Render Plots Inline
+COLORS = {
+    "Robust Tree": "#2563EB", "SVM": "#16A34A",
+    "Logistic Regression": "#D97706", "Random Forest": "#DC2626"
+}
+
+models = list(results.keys())
+metrics = ["worst_case_acc", "avg_acc", "f1"]
+labels = ["Worst-Case Accuracy", "Average Accuracy", "F1 Score (weighted)"]
+colors = [COLORS[m] for m in models]
+
+fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+fig.patch.set_facecolor("#0F172A")
+
+for ax, metric, label in zip(axes, metrics, labels):
+    vals = [results[m][metric] for m in models]
+    bars = ax.bar(range(len(models)), vals, color=colors, edgecolor="#1E293B", width=0.55)
+
+    for bar, v in zip(bars, vals):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                f"{v:.3f}", ha="center", va="bottom", color="white", fontsize=9, fontweight="bold")
+
+    ax.set_xticks([])
+    ax.set_title(label, color="white", fontsize=11, pad=10, fontweight="bold")
+    ax.set_facecolor("#1E293B")
+    ax.spines[:].set_color("#334155")
+    ax.tick_params(axis="y", labelcolor="#94A3B8", labelsize=9)
+    ax.set_ylim(0, 1.15)
+
+patches = [mpatches.Patch(color=COLORS[m], label=m) for m in models]
+fig.legend(handles=patches, loc="lower center", ncol=4, frameon=False, 
+           labelcolor="white", bbox_to_anchor=(0.5, -0.05), fontsize=10)
+
+fig.suptitle("Robust Classification Tree vs Baselines", color="white", fontsize=15, fontweight="bold", y=1.02)
+plt.tight_layout()
+plt.show()
